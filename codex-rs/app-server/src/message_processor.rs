@@ -191,6 +191,27 @@ impl MessageProcessor {
         auth_manager.set_external_auth_refresher(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
         }));
+
+        // SIGHUP handler: reload auth.json from disk on signal.
+        // Enables external tools (e.g. CodexSwitch) to rotate tokens
+        // without restarting the session.
+        #[cfg(unix)]
+        {
+            let auth_for_signal = auth_manager.clone();
+            tokio::spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP listener");
+                loop {
+                    sighup.recv().await;
+                    let changed = auth_for_signal.reload();
+                    if changed {
+                        tracing::info!("SIGHUP: auth reloaded from disk (tokens changed)");
+                    } else {
+                        tracing::debug!("SIGHUP: auth reloaded from disk (no change)");
+                    }
+                }
+            });
+        }
         let thread_manager = Arc::new(ThreadManager::new(
             config.as_ref(),
             auth_manager.clone(),
