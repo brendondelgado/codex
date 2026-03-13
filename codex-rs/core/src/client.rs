@@ -200,6 +200,10 @@ struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
+    /// Auth generation when this WebSocket session was established.
+    /// If auth_generation has since changed (e.g. SIGHUP reload), this cached
+    /// session must be discarded so a fresh connection uses the new auth.
+    auth_generation_at_creation: u64,
 }
 
 enum WebsocketStreamOutcome {
@@ -254,12 +258,32 @@ impl ModelClient {
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
-        let mut cached_websocket_session = self
+        let mut cached = self
             .state
             .cached_websocket_session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *cached_websocket_session)
+
+        // If auth has changed since the cached WebSocket was established (e.g. SIGHUP
+        // token rotation), discard it so a fresh connection uses the new auth headers.
+        if let Some(ref auth_manager) = self.state.auth_manager {
+            let current_gen = auth_manager.auth_generation();
+            if cached.auth_generation_at_creation != current_gen && cached.connection.is_some() {
+                tracing::info!(
+                    "Auth generation changed ({} -> {}), discarding cached WebSocket",
+                    cached.auth_generation_at_creation,
+                    current_gen,
+                );
+                // Take (and drop) the stale session to close the old connection.
+                drop(std::mem::take(&mut *cached));
+                return WebsocketSession {
+                    auth_generation_at_creation: current_gen,
+                    ..WebsocketSession::default()
+                };
+            }
+        }
+
+        std::mem::take(&mut *cached)
     }
 
     fn store_cached_websocket_session(&self, websocket_session: WebsocketSession) {
@@ -678,6 +702,13 @@ impl ModelClientSession {
             ))
         })?;
 
+        // Capture auth generation at the same time credentials are resolved,
+        // before connect_websocket. Prevents TOCTOU: if SIGHUP fires during
+        // connect, the session is correctly stamped with the generation that
+        // matches the credentials it actually used.
+        let generation_at_resolve = self.client.state.auth_manager.as_ref()
+            .map(|am| am.auth_generation());
+
         let connection = self
             .client
             .connect_websocket(
@@ -689,6 +720,9 @@ impl ModelClientSession {
             )
             .await?;
         self.websocket_session.connection = Some(connection);
+        if let Some(auth_gen) = generation_at_resolve {
+            self.websocket_session.auth_generation_at_creation = auth_gen;
+        }
         Ok(())
     }
     /// Returns a websocket connection for this turn.
@@ -705,24 +739,59 @@ impl ModelClientSession {
             None => true,
         };
 
-        if needs_new {
+        // Also force new connection if auth has changed (SIGHUP token rotation).
+        // Capture generation now (same point credentials were resolved by caller)
+        // to avoid TOCTOU if SIGHUP fires during connect_websocket.
+        let current_auth_gen = self
+            .client
+            .state
+            .auth_manager
+            .as_ref()
+            .map(|am| am.auth_generation());
+        let auth_changed = current_auth_gen
+            .is_some_and(|ag| ag != self.websocket_session.auth_generation_at_creation);
+
+        if needs_new || auth_changed {
+            if auth_changed {
+                tracing::info!("Auth changed, opening new WebSocket with fresh credentials");
+            }
             self.websocket_session.last_request = None;
             self.websocket_session.last_response_rx = None;
             let turn_state = options
                 .turn_state
                 .clone()
                 .unwrap_or_else(|| Arc::clone(&self.turn_state));
+
+            // When auth changed, re-resolve credentials so we don't connect
+            // with the caller's stale api_auth. Capture generation at the
+            // same time to keep credentials and generation in sync.
+            let (use_provider, use_auth, use_gen) = if auth_changed {
+                let fresh = self.client.current_client_setup().await.map_err(|err| {
+                    ApiError::Stream(format!(
+                        "failed to re-resolve auth after SIGHUP: {err}"
+                    ))
+                })?;
+                let fresh_gen = self.client.state.auth_manager.as_ref()
+                    .map(|am| am.auth_generation());
+                (fresh.api_provider, fresh.api_auth, fresh_gen)
+            } else {
+                (api_provider, api_auth, current_auth_gen)
+            };
+
             let new_conn = self
                 .client
                 .connect_websocket(
                     session_telemetry,
-                    api_provider,
-                    api_auth,
+                    use_provider,
+                    use_auth,
                     Some(turn_state),
                     turn_metadata_header,
                 )
                 .await?;
             self.websocket_session.connection = Some(new_conn);
+            if let Some(ag) = use_gen {
+                self.websocket_session.auth_generation_at_creation = ag;
+            }
         }
 
         self.websocket_session

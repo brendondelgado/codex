@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_otel::TelemetryAuthMode;
@@ -974,6 +976,10 @@ pub struct AuthManager {
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     forced_chatgpt_workspace_id: RwLock<Option<String>>,
+    /// Monotonically increasing counter incremented on every auth change (SIGHUP reload).
+    /// Consumers (rate limit poller, WebSocket cache) compare against their last-seen
+    /// generation to detect auth changes without polling.
+    auth_generation: AtomicU64,
 }
 
 impl AuthManager {
@@ -1002,6 +1008,7 @@ impl AuthManager {
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             forced_chatgpt_workspace_id: RwLock::new(None),
+            auth_generation: AtomicU64::new(0),
         }
     }
 
@@ -1018,6 +1025,7 @@ impl AuthManager {
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             forced_chatgpt_workspace_id: RwLock::new(None),
+            auth_generation: AtomicU64::new(0),
         })
     }
 
@@ -1036,7 +1044,14 @@ impl AuthManager {
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             forced_chatgpt_workspace_id: RwLock::new(None),
+            auth_generation: AtomicU64::new(0),
         })
+    }
+
+    /// Current auth generation counter. Incremented on every auth change (e.g. SIGHUP reload).
+    /// Consumers can compare against their last-seen generation to detect auth changes.
+    pub fn auth_generation(&self) -> u64 {
+        self.auth_generation.load(Ordering::Acquire)
     }
 
     /// Current cached auth (clone) without attempting a refresh.
@@ -1134,6 +1149,10 @@ impl AuthManager {
             let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
             tracing::info!("Reloaded auth, changed: {changed}");
             guard.auth = new_auth;
+            if changed {
+                let new_gen = self.auth_generation.fetch_add(1, Ordering::Release) + 1;
+                tracing::info!("Auth generation bumped to {new_gen}");
+            }
             changed
         } else {
             false

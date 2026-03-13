@@ -5731,9 +5731,10 @@ impl ChatWidget {
         let auth_manager = Arc::clone(&self.auth_manager);
 
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut last_gen = auth_manager.auth_generation();
 
             loop {
+                // Fetch rate limits with current auth
                 if let Some(auth) = auth_manager.auth().await
                     && auth.is_chatgpt_auth()
                 {
@@ -5741,7 +5742,30 @@ impl ChatWidget {
                         app_event_tx.send(AppEvent::RateLimitSnapshotFetched(snapshot));
                     }
                 }
-                interval.tick().await;
+
+                // Wait up to 60s, but check for auth changes every 2s.
+                // On SIGHUP reload, auth_generation increments and we re-fetch immediately.
+                let mut elapsed = Duration::ZERO;
+                let check_interval = Duration::from_secs(2);
+                let full_interval = Duration::from_secs(60);
+
+                loop {
+                    tokio::time::sleep(check_interval).await;
+                    elapsed += check_interval;
+
+                    let current_gen = auth_manager.auth_generation();
+                    if current_gen != last_gen {
+                        tracing::info!(
+                            "Auth changed (gen {last_gen} -> {current_gen}), re-fetching rate limits"
+                        );
+                        last_gen = current_gen;
+                        break; // Re-fetch immediately
+                    }
+
+                    if elapsed >= full_interval {
+                        break; // Normal 60s interval elapsed
+                    }
+                }
             }
         });
 
