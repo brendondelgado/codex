@@ -594,13 +594,19 @@ async fn run_ratatui_app(
         let auth_for_signal = auth_manager.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
-            let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP listener");
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to register SIGHUP handler: {e}");
+                    return;
+                }
+            };
 
             // Write marker so CodexSwitch knows this binary handles SIGHUP.
             if let Some(home) = dirs::home_dir() {
                 let marker_dir = home.join(".codexswitch");
                 let _ = std::fs::create_dir_all(&marker_dir);
-                let _ = std::fs::write(marker_dir.join("sighup-verified"), "tui\n");
+                let _ = std::fs::write(marker_dir.join("sighup-verified-tui"), "tui\n");
             }
 
             loop {

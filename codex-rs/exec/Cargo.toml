@@ -23,7 +23,6 @@ codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-cloud-requirements = { workspace = true }
 codex-core = { workspace = true }
-dirs = { workspace = true }
 codex-feedback = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
@@ -32,6 +31,7 @@ codex-utils-cli = { workspace = true }
 codex-utils-elapsed = { workspace = true }
 codex-utils-oss = { workspace = true }
 codex-utils-sandbox-summary = { workspace = true }
+dirs = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
