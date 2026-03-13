@@ -208,7 +208,10 @@ impl MessageProcessor {
                     }
                 };
                 loop {
-                    sighup.recv().await;
+                    if sighup.recv().await.is_none() {
+                        tracing::debug!("SIGHUP stream closed, exiting handler");
+                        break;
+                    }
                     let changed = auth_for_signal.reload();
                     if changed {
                         tracing::info!("SIGHUP: auth reloaded from disk (tokens changed)");

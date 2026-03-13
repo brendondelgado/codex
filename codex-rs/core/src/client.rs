@@ -761,19 +761,35 @@ impl ModelClientSession {
                 .turn_state
                 .clone()
                 .unwrap_or_else(|| Arc::clone(&self.turn_state));
+
+            // When auth changed, re-resolve credentials so we don't connect
+            // with the caller's stale api_auth. Capture generation at the
+            // same time to keep credentials and generation in sync.
+            let (use_provider, use_auth, use_gen) = if auth_changed {
+                let fresh = self.client.current_client_setup().await.map_err(|err| {
+                    ApiError::Stream(format!(
+                        "failed to re-resolve auth after SIGHUP: {err}"
+                    ))
+                })?;
+                let fresh_gen = self.client.state.auth_manager.as_ref()
+                    .map(|am| am.auth_generation());
+                (fresh.api_provider, fresh.api_auth, fresh_gen)
+            } else {
+                (api_provider, api_auth, current_auth_gen)
+            };
+
             let new_conn = self
                 .client
                 .connect_websocket(
                     session_telemetry,
-                    api_provider,
-                    api_auth,
+                    use_provider,
+                    use_auth,
                     Some(turn_state),
                     turn_metadata_header,
                 )
                 .await?;
             self.websocket_session.connection = Some(new_conn);
-            // Stamp the generation captured before connect, not after
-            if let Some(ag) = current_auth_gen {
+            if let Some(ag) = use_gen {
                 self.websocket_session.auth_generation_at_creation = ag;
             }
         }
