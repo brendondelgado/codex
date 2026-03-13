@@ -200,6 +200,10 @@ struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
+    /// Auth generation when this WebSocket session was established.
+    /// If auth_generation has since changed (e.g. SIGHUP reload), this cached
+    /// session must be discarded so a fresh connection uses the new auth.
+    auth_generation_at_creation: u64,
 }
 
 enum WebsocketStreamOutcome {
@@ -254,12 +258,30 @@ impl ModelClient {
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
-        let mut cached_websocket_session = self
+        let mut cached = self
             .state
             .cached_websocket_session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *cached_websocket_session)
+
+        // If auth has changed since the cached WebSocket was established (e.g. SIGHUP
+        // token rotation), discard it so a fresh connection uses the new auth headers.
+        if let Some(ref auth_manager) = self.state.auth_manager {
+            let current_gen = auth_manager.auth_generation();
+            if cached.auth_generation_at_creation != current_gen && cached.connection.is_some() {
+                tracing::info!(
+                    "Auth generation changed ({} -> {}), discarding cached WebSocket",
+                    cached.auth_generation_at_creation,
+                    current_gen,
+                );
+                return WebsocketSession {
+                    auth_generation_at_creation: current_gen,
+                    ..WebsocketSession::default()
+                };
+            }
+        }
+
+        std::mem::take(&mut *cached)
     }
 
     fn store_cached_websocket_session(&self, websocket_session: WebsocketSession) {
@@ -689,6 +711,10 @@ impl ModelClientSession {
             )
             .await?;
         self.websocket_session.connection = Some(connection);
+        // Stamp auth generation so cached session can be invalidated on SIGHUP
+        if let Some(ref am) = self.client.state.auth_manager {
+            self.websocket_session.auth_generation_at_creation = am.auth_generation();
+        }
         Ok(())
     }
     /// Returns a websocket connection for this turn.
@@ -705,7 +731,18 @@ impl ModelClientSession {
             None => true,
         };
 
-        if needs_new {
+        // Also force new connection if auth has changed (SIGHUP token rotation)
+        let auth_changed = self
+            .client
+            .state
+            .auth_manager
+            .as_ref()
+            .is_some_and(|am| am.auth_generation() != self.websocket_session.auth_generation_at_creation);
+
+        if needs_new || auth_changed {
+            if auth_changed {
+                tracing::info!("Auth changed, opening new WebSocket with fresh credentials");
+            }
             self.websocket_session.last_request = None;
             self.websocket_session.last_response_rx = None;
             let turn_state = options
@@ -723,6 +760,10 @@ impl ModelClientSession {
                 )
                 .await?;
             self.websocket_session.connection = Some(new_conn);
+            // Stamp the new generation
+            if let Some(ref am) = self.client.state.auth_manager {
+                self.websocket_session.auth_generation_at_creation = am.auth_generation();
+            }
         }
 
         self.websocket_session

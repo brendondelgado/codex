@@ -585,6 +585,36 @@ async fn run_ratatui_app(
         false,
         initial_config.cli_auth_credentials_store_mode,
     );
+
+    // SIGHUP handler: reload auth.json from disk on signal.
+    // Enables external tools (e.g. CodexSwitch) to rotate tokens
+    // without restarting the session.
+    #[cfg(unix)]
+    {
+        let auth_for_signal = auth_manager.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP listener");
+
+            // Write marker so CodexSwitch knows this binary handles SIGHUP.
+            if let Some(home) = dirs::home_dir() {
+                let marker_dir = home.join(".codexswitch");
+                let _ = std::fs::create_dir_all(&marker_dir);
+                let _ = std::fs::write(marker_dir.join("sighup-verified"), "tui\n");
+            }
+
+            loop {
+                sighup.recv().await;
+                let changed = auth_for_signal.reload();
+                if changed {
+                    tracing::info!("SIGHUP: auth reloaded from disk (tokens changed)");
+                } else {
+                    tracing::debug!("SIGHUP: auth reloaded from disk (no change)");
+                }
+            }
+        });
+    }
+
     let login_status = get_login_status(&initial_config);
     let should_show_trust_screen_flag = should_show_trust_screen(&initial_config);
     let should_show_onboarding =

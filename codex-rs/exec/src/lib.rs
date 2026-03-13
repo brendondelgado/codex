@@ -290,6 +290,36 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
     );
+
+    // SIGHUP handler: reload auth.json from disk on signal.
+    // Enables external tools (e.g. CodexSwitch) to rotate tokens
+    // without restarting the session.
+    #[cfg(unix)]
+    {
+        let auth_for_signal = cloud_auth_manager.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP listener");
+
+            // Write marker so CodexSwitch knows this binary handles SIGHUP.
+            if let Some(home) = dirs::home_dir() {
+                let marker_dir = home.join(".codexswitch");
+                let _ = std::fs::create_dir_all(&marker_dir);
+                let _ = std::fs::write(marker_dir.join("sighup-verified"), "exec\n");
+            }
+
+            loop {
+                sighup.recv().await;
+                let changed = auth_for_signal.reload();
+                if changed {
+                    tracing::info!("SIGHUP: auth reloaded from disk (tokens changed)");
+                } else {
+                    tracing::debug!("SIGHUP: auth reloaded from disk (no change)");
+                }
+            }
+        });
+    }
+
     let chatgpt_base_url = config_toml
         .chatgpt_base_url
         .clone()
