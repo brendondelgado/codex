@@ -200,7 +200,13 @@ impl MessageProcessor {
             let auth_for_signal = auth_manager.clone();
             tokio::spawn(async move {
                 use tokio::signal::unix::{SignalKind, signal};
-                let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP listener");
+                let mut sighup = match signal(SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to register SIGHUP handler: {e}");
+                        return;
+                    }
+                };
                 loop {
                     sighup.recv().await;
                     let changed = auth_for_signal.reload();

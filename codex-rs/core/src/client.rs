@@ -274,6 +274,8 @@ impl ModelClient {
                     cached.auth_generation_at_creation,
                     current_gen,
                 );
+                // Take (and drop) the stale session to close the old connection.
+                drop(std::mem::take(&mut *cached));
                 return WebsocketSession {
                     auth_generation_at_creation: current_gen,
                     ..WebsocketSession::default()
@@ -700,6 +702,13 @@ impl ModelClientSession {
             ))
         })?;
 
+        // Capture auth generation at the same time credentials are resolved,
+        // before connect_websocket. Prevents TOCTOU: if SIGHUP fires during
+        // connect, the session is correctly stamped with the generation that
+        // matches the credentials it actually used.
+        let generation_at_resolve = self.client.state.auth_manager.as_ref()
+            .map(|am| am.auth_generation());
+
         let connection = self
             .client
             .connect_websocket(
@@ -711,9 +720,8 @@ impl ModelClientSession {
             )
             .await?;
         self.websocket_session.connection = Some(connection);
-        // Stamp auth generation so cached session can be invalidated on SIGHUP
-        if let Some(ref am) = self.client.state.auth_manager {
-            self.websocket_session.auth_generation_at_creation = am.auth_generation();
+        if let Some(auth_gen) = generation_at_resolve {
+            self.websocket_session.auth_generation_at_creation = auth_gen;
         }
         Ok(())
     }
@@ -731,13 +739,17 @@ impl ModelClientSession {
             None => true,
         };
 
-        // Also force new connection if auth has changed (SIGHUP token rotation)
-        let auth_changed = self
+        // Also force new connection if auth has changed (SIGHUP token rotation).
+        // Capture generation now (same point credentials were resolved by caller)
+        // to avoid TOCTOU if SIGHUP fires during connect_websocket.
+        let current_auth_gen = self
             .client
             .state
             .auth_manager
             .as_ref()
-            .is_some_and(|am| am.auth_generation() != self.websocket_session.auth_generation_at_creation);
+            .map(|am| am.auth_generation());
+        let auth_changed = current_auth_gen
+            .is_some_and(|ag| ag != self.websocket_session.auth_generation_at_creation);
 
         if needs_new || auth_changed {
             if auth_changed {
@@ -760,9 +772,9 @@ impl ModelClientSession {
                 )
                 .await?;
             self.websocket_session.connection = Some(new_conn);
-            // Stamp the new generation
-            if let Some(ref am) = self.client.state.auth_manager {
-                self.websocket_session.auth_generation_at_creation = am.auth_generation();
+            // Stamp the generation captured before connect, not after
+            if let Some(ag) = current_auth_gen {
+                self.websocket_session.auth_generation_at_creation = ag;
             }
         }
 
